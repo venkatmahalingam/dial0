@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""List the GGUF quantizations in a Hugging Face repo and whether they fit your box.
+
+  dial0-quants                                   # default repo unsloth/Qwen3.5-4B-GGUF
+  dial0-quants unsloth/Qwen3.5-2B-GGUF --ram 12  # GB of RAM you are willing to give the model
+Run it on any machine with internet (the container itself needs none at runtime).
+"""
+import argparse, json, re, sys, urllib.request
+
+p = argparse.ArgumentParser()
+p.add_argument("repo", nargs="?", default="unsloth/Qwen3.5-4B-GGUF")
+p.add_argument("--ram", type=float, default=5.0, help="GB RAM budget (default 5, matches MEMORY in dial0.conf)")
+a = p.parse_args()
+
+url = f"https://huggingface.co/api/models/{a.repo}/tree/main"
+try:
+    items = json.load(urllib.request.urlopen(url, timeout=30))
+except Exception as e:
+    sys.exit(f"cannot list {a.repo}: {e}")
+
+rows = []
+for it in items:
+    n = it.get("path", "")
+    if n.endswith(".gguf") and not n.lower().startswith("mmproj") and "imatrix" not in n.lower():
+        size = (it.get("lfs") or {}).get("size") or it.get("size", 0)
+        q = re.search(r"((?:UD-)?I?Q\d\w*|BF16|F16|F32)\.gguf$", n)
+        rows.append((size, n, q.group(1) if q else "?", (it.get("lfs") or {}).get("oid", "")))
+rows.sort()
+print(f"{a.repo}  (RAM budget {a.ram:g} GB; weights + ~0.5 GB for KV cache/runtime)\n")
+print(f"{'quant':<12}{'size GB':>8}  {'fits':<5} file")
+for size, n, q, sha in rows:
+    gb = size / 1e9
+    print(f"{q:<12}{gb:>8.2f}  {'yes' if gb + 0.5 <= a.ram else 'no':<5} {n}")
+    if sha:
+        print(f"{'':<27}sha256 {sha}")
+print("\nUse: MODEL_REPO=<repo> MODEL_FILE=<file> in dial0.conf (MODEL_SHA256 optional), then: dial0 ctl rebuild")

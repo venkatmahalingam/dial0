@@ -1,0 +1,30 @@
+# Runs both test suites on every push and pull request. No Docker, model or switch needed: the tests use
+# fake SONiC commands and a stub model.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Python 3.10 compatibility check
+        run: python tests/py310_check.py
+      - name: Agent, harness, workflows, blueprints (tests/run_tests.py)
+        run: python tests/run_tests.py
+      - name: Host command (tests/test_host.sh)
+        run: bash tests/test_host.sh

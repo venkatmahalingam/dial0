@@ -1,0 +1,597 @@
+#!/usr/bin/env bash
+# Dial 0 host command (needs only bash + docker + curl).
+#   dial0 "configure VLAN 100 on Ethernet1"     talk to the agent       (dial0 --help for options)
+#   dial0 ctl <command>                         manage Dial 0           (dial0 ctl help)
+#
+# Images:  dial0-base:<hash>  llama.cpp + Python + SONiC command index   (slow, built once, reused)
+#          dial0-sonic:latest Dial 0 code on top of the base             (seconds to rebuild)
+# Model:   downloaded once to MODELS_DIR on the switch and mounted read-only (not inside the image).
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+HOME_DIR="${DIAL0_HOME:-$(dirname "$(dirname "$SELF")")}"
+CONF="${DIAL0_CONF:-$HOME_DIR/dial0.conf}"
+BIN_DIR="${DIAL0_BIN_DIR:-/usr/local/bin}"
+CPUINFO="${DIAL0_CPUINFO:-/proc/cpuinfo}"
+MEMINFO="${DIAL0_MEMINFO:-/proc/meminfo}"
+SONIC_VERSION_FILE="${DIAL0_SONIC_VERSION:-/etc/sonic/sonic_version.yml}"
+
+RUN_KEYS=" CPUS CPUSET MEMORY STORAGE CONFIRM CONTEXT LEARN FIX_ROUNDS WORKFLOW_KEEP WORKFLOW_INSIGHTS SEARCH_RETRY SONIC_SRC_DIR LLAMA_CTX LLAMA_PORT API_PORT BANNER REASONING REPAIR_WITH_MODEL WARMUP LIVE_CHECK MCP_SERVER_URL MCP_AUTH_TOKEN "
+MODEL_KEYS=" MODEL_REPO MODEL_FILE MODEL_SHA256 "
+BUILD_KEYS=" LLAMA_SOURCE LLAMA_IMAGE SONIC_UTILITIES_REF LLAMA_CPP_REF CPU_TUNE BUILD_JOBS KEEP_BUILD_CACHE HTTP_PROXY HTTPS_PROXY "
+NAME_KEYS=" IMAGE CONTAINER STATE_VOLUME MODELS_DIR "
+DOC_KEYS=" CMDREF "
+
+load_conf() {  # parses KEY=value lines; never executes the file
+  CPUS=1; CPUSET=auto; MEMORY=5g; STORAGE=8g; CONFIRM=ask; CONTEXT=off; LEARN=on; FIX_ROUNDS=3; WORKFLOW_KEEP=10; WORKFLOW_INSIGHTS=on; SEARCH_RETRY=on; SONIC_SRC_DIR=auto; LLAMA_CTX=8192
+  LLAMA_PORT=18081; API_PORT=8090; BANNER=on; REASONING=on; REPAIR_WITH_MODEL=off; WARMUP=auto; LIVE_CHECK=on
+  MCP_SERVER_URL=; MCP_AUTH_TOKEN=
+  MODEL_REPO=unsloth/Qwen3.5-4B-GGUF; MODEL_FILE=Qwen3.5-4B-UD-Q4_K_XL.gguf; MODEL_SHA256=
+  LLAMA_SOURCE=prebuilt; LLAMA_IMAGE=ghcr.io/ggml-org/llama.cpp:server
+  SONIC_UTILITIES_REF=auto; LLAMA_CPP_REF=master; CPU_TUNE=native; BUILD_JOBS=auto; KEEP_BUILD_CACHE=no
+  HTTP_PROXY=; HTTPS_PROXY=; IMAGE=dial0-sonic:latest; CONTAINER=dial0; STATE_VOLUME=dial0-state; MODELS_DIR=
+  CMDREF=reference/sonic-command-reference.md
+  local line key val
+  if [ -f "$CONF" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]] || continue
+      key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+      val="${val%%[[:space:]]*}"                       # values have no spaces; drop "   # comment"
+      val="${val#[\"\']}"; val="${val%[\"\']}"         # tolerate KEY="value"
+      case "$RUN_KEYS$MODEL_KEYS$BUILD_KEYS$NAME_KEYS$DOC_KEYS" in *" $key "*) printf -v "$key" '%s' "$val" ;; esac
+    done < "$CONF"
+  fi
+  C="${DIAL0_CONTAINER:-$CONTAINER}"
+  M_DIR="${MODELS_DIR:-$HOME_DIR/models}"
+}
+load_conf
+
+DOCKER=(docker)
+if ! docker info >/dev/null 2>&1; then DOCKER=(sudo docker); fi
+d() { "${DOCKER[@]}" "$@"; }
+exists()     { [ -n "$(d ps -aq --filter "name=^${C}$")" ]; }
+running()    { [ -n "$(d ps -q --filter "name=^${C}$" --filter status=running)" ]; }
+have_image() { d image inspect "$IMAGE" >/dev/null 2>&1; }
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  [ok]   %s\n' "$*"; }
+warn() { printf '  [warn] %s\n' "$*"; }
+bad()  { printf '  [FAIL] %s\n' "$*"; FAILED=1; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------------ helpers
+to_mb() {  # 6g -> 6144, 512m -> 512
+  local v="${1,,}"
+  case "$v" in
+    *g) [[ "${v%g}" =~ ^[0-9]+$ ]] && echo $(( ${v%g} * 1024 )) && return ;;
+    *m) [[ "${v%m}" =~ ^[0-9]+$ ]] && echo "${v%m}" && return ;;
+  esac
+  return 1
+}
+cpu_total() { echo "${DIAL0_NPROC:-$(nproc --all)}"; }
+mem_total_mb() { awk '/^MemTotal:/ {print int($2/1024)}' "$MEMINFO"; }
+docker_root() { d info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker; }
+disk_free_mb() { local p; p="$(docker_root)"; [ -d "$p" ] || p=/; df -Pm "$p" | awk 'NR==2 {print $4}'; }
+image_mb() { have_image && echo $(( $(d image inspect -f '{{.Size}}' "$IMAGE") / 1048576 )) || echo 0; }
+
+# (grep without -q reads all of its input: with pipefail, -q quitting early would SIGPIPE the producer
+#  and make the whole pipeline "fail" even though it matched)
+port_busy() { ss -ltnH 2>/dev/null | awk '{print $4}' | grep -E "[:.]$1\$" >/dev/null; }
+port_user() { ss -ltnpH 2>/dev/null | awk -v p=":$1" '$4 ~ p"$" {print $6}' | head -1 | sed 's/users://; s/[()"]//g' | cut -d, -f1 | sed 's/^$/unknown/'; }
+our_ports() {  # ports of our own container, running or restarting (it gets recreated, so they're ours to reuse)
+  exists || return 0
+  d inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$C" 2>/dev/null | awk -F= '$1=="LLAMA_PORT"||$1=="DIAL0_API_PORT"{printf "%s ", $2}'
+}
+
+resolve_cpus() {  # sets CPU_LIST (docker --cpuset-cpus) and NCPU
+  local total; total="$(cpu_total)"
+  if [ "$CPUSET" = auto ]; then
+    [[ "$CPUS" =~ ^[0-9]+$ ]] && [ "$CPUS" -ge 1 ] || { bad "CPUS must be a whole number >= 1 (got '$CPUS')"; return; }
+    NCPU="$CPUS"; CPU_LIST="$(seq -s, $(( total - CPUS )) $(( total - 1 )) 2>/dev/null || true)"
+  else
+    [[ "$CPUSET" =~ ^[0-9,-]+$ ]] || { bad "CPUSET must be auto or a list like 2,3 or 2-3 (got '$CPUSET')"; return; }
+    CPU_LIST="$CPUSET"; NCPU=0; local part
+    IFS=, read -ra parts <<< "$CPUSET"
+    for part in "${parts[@]}"; do
+      if [[ "$part" == *-* ]]; then NCPU=$(( NCPU + ${part#*-} - ${part%-*} + 1 )); else NCPU=$(( NCPU + 1 )); fi
+      [ "${part#*-}" -lt "$total" ] || bad "CPUSET $CPUSET: this switch only has CPUs 0-$(( total - 1 ))"
+    done
+  fi
+}
+
+detect_sonic_ref() {
+  if [ "$SONIC_UTILITIES_REF" != auto ]; then echo "$SONIC_UTILITIES_REF"; return; fi
+  local v; v="$(grep -m1 '^build_version' "$SONIC_VERSION_FILE" 2>/dev/null || true)"
+  if [[ "$v" =~ (20[0-9]{4}) ]]; then echo "${BASH_REMATCH[1]}"; else echo master; fi
+}
+
+# The switch's installed SONiC CLI (config/ + show/): the exact commands this switch supports.
+switch_src_dir() {
+  if [ "$SONIC_SRC_DIR" != auto ]; then
+    [ -f "$SONIC_SRC_DIR/config/main.py" ] && [ -f "$SONIC_SRC_DIR/show/main.py" ] && echo "$SONIC_SRC_DIR"
+    return 0
+  fi
+  local d
+  # shellcheck disable=SC2086
+  for d in ${DIAL0_SRC_CANDIDATES:-/usr/local/lib/python3.11/dist-packages /usr/local/lib/python3*/dist-packages /usr/lib/python3/dist-packages}; do
+    if [ -f "$d/config/main.py" ] && [ -f "$d/show/main.py" ]; then echo "$d"; return 0; fi
+  done
+}
+
+build_jobs() { if [ "$BUILD_JOBS" = auto ]; then local n; n="$(cpu_total)"; echo $(( n > 1 ? n - 1 : 1 )); else echo "$BUILD_JOBS"; fi; }
+
+# ------------------------------------------------------------------ versions
+base_dockerfile() { echo "$HOME_DIR/docker/base-$LLAMA_SOURCE.Dockerfile"; }
+base_tag() {  # changes only when something that goes into the base changes
+  local h
+  h="$( { cat "$(base_dockerfile)" "$HOME_DIR/requirements.txt" "$HOME_DIR/dial0/extract_cli.py"
+          echo "$LLAMA_SOURCE $(detect_sonic_ref)"
+          if [ "$LLAMA_SOURCE" = prebuilt ]; then echo "$LLAMA_IMAGE"; else echo "$LLAMA_CPP_REF $CPU_TUNE"; fi
+        } | sha256sum | cut -c1-12 )"
+  echo "dial0-base:$h"
+}
+# App version = the Dial 0 code + the base it sits on, so any change is detected.
+src_version() { { (cd "$HOME_DIR" && cat Dockerfile entrypoint.sh dial0/*.py 2>/dev/null); base_tag; } | sha256sum | cut -c1-12; }
+image_version() { d image inspect -f '{{index .Config.Labels "dial0.version"}}' "$IMAGE" 2>/dev/null || true; }
+running_version() { d inspect -f '{{index .Config.Labels "dial0.version"}}' "$C" 2>/dev/null || true; }
+
+# ------------------------------------------------------------------ model (on the switch disk, not in the image)
+model_url()  { echo "https://huggingface.co/${MODEL_REPO}/resolve/main/${MODEL_FILE}"; }
+model_file() { echo "$M_DIR/$MODEL_FILE"; }
+model_ready() { [ -s "$(model_file)" ] && [ -f "$(model_file).ok" ]; }
+model_local_mb() { if [ -f "$(model_file)" ]; then echo $(( $(stat -c %s "$(model_file)") / 1048576 )); fi; }
+model_remote_bytes() {  # size of MODEL_FILE on Hugging Face; empty if unknown / missing
+  local h; h="$(curl -sSIL --max-time 20 "$(model_url)" 2>/dev/null || true)"
+  if ! printf '%s' "$h" | grep -iE '^HTTP/[0-9.]+ (200|302)' >/dev/null; then return 0; fi
+  printf '%s' "$h" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-linked-size"{s=$2} tolower($1)=="content-length"{c=$2} END{v=(s?s:c); if (v>100000000) print v}'
+}
+model_remote_mb() { local b; b="$(model_remote_bytes)"; if [ -n "$b" ]; then echo $(( b / 1048576 )); fi; }
+
+fetch_model() {  # resumable download + checks; "$1" = quiet (for background use)
+  local f part total have
+  f="$(model_file)"; part="$f.part"
+  model_ready && { say "model $MODEL_FILE: already downloaded"; return 0; }
+  mkdir -p "$M_DIR"
+  [ -n "$HTTPS_PROXY" ] && export https_proxy="$HTTPS_PROXY" HTTPS_PROXY
+  [ -n "$HTTP_PROXY" ] && export http_proxy="$HTTP_PROXY" HTTP_PROXY
+  total="$(model_remote_bytes)"
+  have=0; [ -f "$part" ] && have="$(stat -c %s "$part")"
+  if [ -z "$total" ] || [ "$have" != "$total" ]; then
+    say "downloading $MODEL_FILE -> $M_DIR$( [ "$have" -gt 0 ] && echo " (resuming at $(( have / 1048576 )) MB)")"
+    local progress=(--progress-bar); [ "${1:-}" = quiet ] && progress=(-sS)
+    curl -fL --retry 5 --retry-delay 5 -C - "${progress[@]}" -o "$part" "$(model_url)" \
+      || { say "model download failed (re-run to resume)"; return 1; }
+  fi
+  [ "$(head -c 4 "$part")" = GGUF ] || { rm -f "$part"; say "downloaded file is not a GGUF model (wrong MODEL_FILE?)"; return 1; }
+  if [ -n "$MODEL_SHA256" ] && ! echo "$MODEL_SHA256  $part" | sha256sum -c --status; then
+    rm -f "$part"; say "model sha256 mismatch"; return 1
+  fi
+  mv "$part" "$f"; date > "$f.ok"
+  say "model ready: $f ($(model_local_mb) MB)"
+}
+
+# ------------------------------------------------------------------ the command reference (only its commands are used)
+CMDREF_DL="$HOME_DIR/data/reference.md"
+cmdref_is_url() { [[ "$CMDREF" =~ ^https?:// ]]; }
+cmdref_file() {  # the file to mount: CMDREF itself (relative to this folder or absolute), or the downloaded copy of a URL
+  if cmdref_is_url; then echo "$CMDREF_DL"
+  elif [[ "$CMDREF" = /* ]]; then echo "$CMDREF"
+  else echo "$HOME_DIR/$CMDREF"; fi
+}
+cmdref_raw_url() {  # github.com/<o>/<r>/blob/<ref>/<path> -> raw.githubusercontent.com/<o>/<r>/<ref>/<path>
+  local u="$CMDREF"
+  if [[ "$u" =~ ^https?://github\.com/([^/]+)/([^/]+)/blob/(.+)$ ]]; then
+    u="https://raw.githubusercontent.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+  fi
+  echo "$u"
+}
+fetch_cmdref() {  # only when CMDREF is a URL
+  cmdref_is_url || return 0
+  mkdir -p "$(dirname "$CMDREF_DL")"
+  [ -n "$HTTPS_PROXY" ] && export https_proxy="$HTTPS_PROXY" HTTPS_PROXY
+  if curl -fsSL --retry 3 --max-time 120 -o "$CMDREF_DL.part" "$(cmdref_raw_url)" \
+     && grep -qE '^[[:space:]]*(\*\*)?(sudo )?(show|config) ' "$CMDREF_DL.part"; then
+    mv "$CMDREF_DL.part" "$CMDREF_DL"
+    say "command reference downloaded: $(cmdref_raw_url)"
+  else
+    rm -f "$CMDREF_DL.part"; say "warning: could not download the command reference from $(cmdref_raw_url)"; return 1
+  fi
+}
+
+remove_old_models() {  # keep only the configured model (disk budget)
+  local x keep; keep="$(model_file)"
+  for x in "$M_DIR"/*.gguf "$M_DIR"/*.gguf.part; do
+    [ -e "$x" ] || continue
+    if [ "$x" != "$keep" ] && [ "$x" != "$keep.part" ]; then rm -f "$x" "$x.ok"; say "removed old model $(basename "$x")"; fi
+  done
+}
+
+remove_old_bases() {  # keep only the current base image
+  local t
+  for t in $(d images --format '{{.Repository}}:{{.Tag}}' dial0-base 2>/dev/null); do
+    [ "$t" = "$1" ] || { d rmi "$t" >/dev/null 2>&1 && say "removed old base image $t" || true; }
+  done
+}
+
+# ------------------------------------------------------------------ checks
+check_all() {  # $1 = build|run
+  local mode="$1" total mem mem_total sto free model_mb need
+  FAILED=0
+  say "Checks:"
+  [ "$(uname -m)" = x86_64 ] && ok "x86_64" || bad "architecture $(uname -m) is not supported (x86_64 only)"
+  d info >/dev/null 2>&1 && ok "docker $(d version -f '{{.Server.Version}}' 2>/dev/null)" || bad "cannot talk to docker"
+  [ -f "$SONIC_VERSION_FILE" ] && ok "SONiC $(grep -m1 '^build_version' "$SONIC_VERSION_FILE" | cut -d: -f2- | tr -d " '\"")" \
+    || warn "not a SONiC switch ($SONIC_VERSION_FILE missing): commands can't run here, build/test only"
+
+  # the command reference: only its commands are offered to / accepted from the model
+  local rf; rf="$(cmdref_file)"
+  if [ -f "$rf" ]; then ok "command reference: $rf: only these commands are used"
+  elif cmdref_is_url; then ok "command reference: will be downloaded from $(cmdref_raw_url)"
+  else bad "command reference $rf not found (CMDREF in dial0.conf)"; fi
+
+  # the switch's own SONiC CLI code = the command reference
+  local sd; sd="$(switch_src_dir)"
+  if [ -n "$sd" ]; then ok "SONiC CLI source: $sd (config/, show/): used as the command reference"
+  elif [ "$SONIC_SRC_DIR" != auto ]; then bad "SONIC_SRC_DIR=$SONIC_SRC_DIR has no config/main.py and show/main.py"
+  else warn "switch's SONiC CLI source not found: using the sonic-utilities index from GitHub (set SONIC_SRC_DIR=...)"; fi
+
+  # CPU
+  total="$(cpu_total)"; resolve_cpus
+  if [ -n "${NCPU:-}" ]; then
+    if [ "$NCPU" -ge "$total" ]; then bad "CPUS=$NCPU but the switch has $total CPUs: leave at least 1 for SONiC"
+    else ok "CPU: $NCPU of $total cores for Dial 0 (cores $CPU_LIST)"; fi
+  fi
+  [ "$mode" = build ] && ! grep -q -m1 avx2 "$CPUINFO" 2>/dev/null && warn "CPU does not report AVX2: inference will be very slow"
+
+  # internet (build, or a model still to download)
+  if [ "$mode" = build ] || ! model_ready; then
+    if [ -n "${DIAL0_SKIP_NET_CHECK:-}" ]; then warn "internet check skipped"
+    elif curl -sSI --max-time 15 https://github.com >/dev/null 2>&1; then ok "internet: reachable"
+    else bad "internet: github.com not reachable (needed to build/download; set HTTP_PROXY/HTTPS_PROXY in dial0.conf if you use a proxy)"; fi
+  fi
+
+  # model
+  if model_ready; then model_mb="$(model_local_mb)"; ok "model $MODEL_FILE: downloaded ($model_mb MB)"
+  else
+    model_mb="$(model_remote_mb)"
+    if [ -n "$model_mb" ]; then ok "model $MODEL_FILE: $model_mb MB to download (once)"
+    elif [ -z "${DIAL0_SKIP_NET_CHECK:-}" ]; then bad "model $MODEL_REPO/$MODEL_FILE not found on Hugging Face (check the name: host/dial0-quants $MODEL_REPO)"; fi
+  fi
+  model_mb="${model_mb:-3000}"
+
+  # Ports (the container uses the host network, so they must be free on the switch)
+  local ours p ports_ok=1
+  ours="$(our_ports)"
+  if [ "$LLAMA_PORT" = "$API_PORT" ]; then bad "LLAMA_PORT and API_PORT are both $LLAMA_PORT: use two different ports"
+  else
+    for p in "$LLAMA_PORT" "$API_PORT"; do
+      if port_busy "$p" && [[ " $ours " != *" $p "* ]]; then
+        ports_ok=0; bad "port $p is already in use on the switch ($(port_user "$p")): choose another, e.g. dial0 ctl set $( [ "$p" = "$LLAMA_PORT" ] && echo LLAMA_PORT || echo API_PORT )=$(( p + 1 ))"
+      fi
+    done
+    if [ "$ports_ok" = 1 ]; then ok "ports: llama.cpp $LLAMA_PORT, agent API $API_PORT (127.0.0.1)"; fi
+  fi
+
+  # RAM
+  if mem="$(to_mb "$MEMORY")"; then
+    mem_total="$(mem_total_mb)"
+    if [ "$mem" -gt "$mem_total" ]; then bad "MEMORY=$MEMORY is more than the switch has ($mem_total MB)"
+    elif [ "$mem" -lt $(( model_mb + 1024 )) ]; then bad "MEMORY=$MEMORY too small for the model (~$model_mb MB): use at least $(( (model_mb + 1024 + 1023) / 1024 ))g"
+    else
+      ok "RAM: $MEMORY for Dial 0 (switch has $mem_total MB)"
+      [ "$mem" -gt $(( mem_total - 2048 )) ] && warn "less than 2 GB RAM would be left for SONiC"
+    fi
+  else bad "MEMORY must look like 5g or 5120m (got '$MEMORY')"; fi
+
+  # Storage: images (~1 GB) + model file + sessions/logs
+  if sto="$(to_mb "$STORAGE")"; then
+    free="$(disk_free_mb)"
+    if [ "$sto" -lt $(( model_mb + 1300 )) ]; then bad "STORAGE=$STORAGE too small (model ~$model_mb MB + images ~1 GB): use at least $(( (model_mb + 1300 + 1023) / 1024 ))g"
+    else ok "storage budget: $STORAGE (model ~$model_mb MB + images ~1 GB + sessions/logs)"; fi
+    need=0
+    model_ready || need=$(( need + model_mb ))
+    if [ "$mode" = build ] && ! d image inspect "$(base_tag)" >/dev/null 2>&1; then
+      if [ "$LLAMA_SOURCE" = compile ]; then need=$(( need + 2500 )); else need=$(( need + 1500 )); fi
+    fi
+    if [ "$need" -gt 0 ]; then
+      if [ "$free" -lt $(( need + 300 )) ]; then bad "disk: $free MB free in $(docker_root), needs ~$(( need + 300 )) MB"
+      else ok "disk: $free MB free (needs ~$need MB)"; fi
+    fi
+  else bad "STORAGE must look like 8g (got '$STORAGE')"; fi
+
+  [ "$FAILED" = 0 ] || { say "Fix the [FAIL] items (dial0.conf or: dial0 ctl set KEY=VALUE) and re-run."; return 1; }
+}
+
+# ------------------------------------------------------------------ build / run
+ctl_build() {  # $1 = force  -> rebuild the base too
+  local ref tag t0=$SECONDS mpid="" proxy=() pull=() ok_build
+  ref="$(detect_sonic_ref)"; tag="$(base_tag)"
+  [ -f "$(base_dockerfile)" ] || die "LLAMA_SOURCE must be prebuilt or compile (no $(base_dockerfile))"
+  [ -n "$HTTP_PROXY" ]  && proxy+=(--build-arg "http_proxy=$HTTP_PROXY"  --build-arg "HTTP_PROXY=$HTTP_PROXY")
+  [ -n "$HTTPS_PROXY" ] && proxy+=(--build-arg "https_proxy=$HTTPS_PROXY" --build-arg "HTTPS_PROXY=$HTTPS_PROXY")
+  : > "$HOME_DIR/build.log"
+
+  if ! model_ready; then  # in parallel with the build
+    say "Downloading the model in the background: $MODEL_FILE (log: model-download.log)"
+    ( fetch_model quiet > "$HOME_DIR/model-download.log" 2>&1 ) & mpid=$!
+  fi
+
+  if [ "${1:-}" = force ] || ! d image inspect "$tag" >/dev/null 2>&1; then
+    [ "${1:-}" = force ] && pull=(--pull)
+    if [ "$LLAMA_SOURCE" = prebuilt ]; then
+      say "Building the base image $tag: official llama.cpp server image ($LLAMA_IMAGE), Python, SONiC $ref command index."
+      say "No compiling; a few minutes, once. Later updates reuse it."
+    else
+      say "Building the base image $tag: compiling llama.cpp ($LLAMA_CPP_REF, $CPU_TUNE, $(build_jobs) jobs), Python, SONiC $ref index."
+      say "Takes ~10-20 min, once. Later updates reuse it."
+    fi
+    ok_build=1
+    d build --network host ${pull[@]+"${pull[@]}"} -f "$(base_dockerfile)" -t "$tag" \
+      --build-arg LLAMA_IMAGE="$LLAMA_IMAGE" --build-arg SONIC_UTILITIES_REF="$ref" \
+      --build-arg LLAMA_CPP_REF="$LLAMA_CPP_REF" --build-arg CPU_TUNE="$CPU_TUNE" --build-arg BUILD_JOBS="$(build_jobs)" \
+      ${proxy[@]+"${proxy[@]}"} "$HOME_DIR" 2>&1 | tee -a "$HOME_DIR/build.log" || ok_build=0
+    [ "$ok_build" = 1 ] || { [ -n "$mpid" ] && kill "$mpid" 2>/dev/null; die "base build failed, see $HOME_DIR/build.log"; }
+    grep -E "commands: [0-9]+ " "$HOME_DIR/build.log" | tail -1 | sed 's/^/  sonic-utilities index: /' || true
+  else
+    say "Base image $tag is up to date: reused (nothing compiled or downloaded)."
+  fi
+
+  say "Building the app image (Dial 0 code only)..."
+  ok_build=1
+  d build -f "$HOME_DIR/Dockerfile" -t "$IMAGE" --build-arg BASE_IMAGE="$tag" \
+    --label "dial0.version=$(src_version)" --label "dial0.base=$tag" "$HOME_DIR" 2>&1 | tee -a "$HOME_DIR/build.log" || ok_build=0
+  [ "$ok_build" = 1 ] || { [ -n "$mpid" ] && kill "$mpid" 2>/dev/null; die "app build failed, see $HOME_DIR/build.log"; }
+
+  if [ -n "$mpid" ]; then
+    say "Waiting for the model download to finish..."
+    if ! wait "$mpid"; then tail -3 "$HOME_DIR/model-download.log" | sed 's/^/  | /'; die "model download failed (re-run to resume)"; fi
+  fi
+  remove_old_models
+  remove_old_bases "$tag"
+  if [ "$KEEP_BUILD_CACHE" != yes ]; then d builder prune -af >/dev/null 2>&1 || true; d image prune -f >/dev/null 2>&1 || true; fi
+  say "Build finished in $(( SECONDS - t0 ))s. Images $(image_mb) MB + model $(model_local_mb) MB, disk free $(disk_free_mb) MB."
+}
+
+ctl_up() {
+  have_image || die "image $IMAGE not found: run ./setup.sh"
+  model_ready || die "model $MODEL_FILE not downloaded: run dial0 ctl model"
+  FAILED=0; resolve_cpus; [ "$FAILED" = 0 ] || exit 1
+  if exists; then d start "$C" >/dev/null; say "started $C"; return; fi
+  local sto state sd src=() px=(); sto="$(to_mb "$STORAGE")"
+  # the CVE scan downloads its data from inside the container: give it the same proxy as the host
+  [ -n "$HTTPS_PROXY" ] && px+=(-e "HTTPS_PROXY=$HTTPS_PROXY" -e "https_proxy=$HTTPS_PROXY")
+  [ -n "$HTTP_PROXY" ] && px+=(-e "HTTP_PROXY=$HTTP_PROXY" -e "http_proxy=$HTTP_PROXY")
+  sd="$(switch_src_dir)"
+  if [ -n "$sd" ]; then  # read-only: Dial 0 indexes it, never changes it
+    src=(-v "$sd/config":/opt/switch-src/config:ro -v "$sd/show":/opt/switch-src/show:ro
+         -e DIAL0_SWITCH_SRC=/opt/switch-src -e DIAL0_SWITCH_SRC_HOST="$sd")
+  fi
+  local rf; rf="$(cmdref_file)"
+  if [ -f "$rf" ]; then
+    src+=(-v "$rf":/opt/cmdref/reference.md:ro -e DIAL0_CMDREF=/opt/cmdref/reference.md -e DIAL0_CMDREF_HOST="$rf")
+  fi
+  state=$(( sto - $(image_mb) - $(model_local_mb) - 30 )); [ "$state" -gt 500 ] && state=500; [ "$state" -lt 20 ] && state=20
+  d run -d --init --name "$C" --restart unless-stopped \
+    --privileged --pid=host --network=host \
+    --cpuset-cpus="$CPU_LIST" --cpus="$NCPU" --memory="$MEMORY" --memory-swap="$MEMORY" \
+    --log-opt max-size=10m --log-opt max-file=3 \
+    -v "$STATE_VOLUME":/var/lib/dial0 -v "$M_DIR":/models:ro -e MODEL_PATH="/models/$MODEL_FILE" \
+    ${src[@]+"${src[@]}"} ${px[@]+"${px[@]}"} -e DIAL0_SEARCH_RETRY="$SEARCH_RETRY" \
+    -e LLAMA_THREADS="$NCPU" -e LLAMA_CTX="$LLAMA_CTX" -e LLAMA_PORT="$LLAMA_PORT" -e LLAMA_URL="http://127.0.0.1:$LLAMA_PORT" \
+    -e DIAL0_API_PORT="$API_PORT" -e DIAL0_CONFIRM="$CONFIRM" -e DIAL0_CONTEXT="$CONTEXT" -e DIAL0_LEARN="$LEARN" -e DIAL0_FIX_ROUNDS="$FIX_ROUNDS" -e DIAL0_BANNER="$BANNER" -e DIAL0_WORKFLOW_KEEP="$WORKFLOW_KEEP" -e DIAL0_WORKFLOW_INSIGHTS="$WORKFLOW_INSIGHTS" \
+    -v /etc/localtime:/etc/localtime:ro \
+    -e DIAL0_LIVE_CHECK="$LIVE_CHECK" -e DIAL0_REASONING="$REASONING" -e DIAL0_MODEL_REPAIR="$REPAIR_WITH_MODEL" \
+    -e DIAL0_WARMUP="$WARMUP" -e DIAL0_STATE_MAX_MB="$state" \
+    -e MCP_SERVER_URL="$MCP_SERVER_URL" -e MCP_AUTH_TOKEN="$MCP_AUTH_TOKEN" \
+    "$IMAGE" >/dev/null
+  say "started $C: $NCPU CPU (cores $CPU_LIST), RAM $MEMORY, model $MODEL_FILE, confirm=$CONFIRM, context=$CONTEXT"
+  say "command reference: ${sd:-sonic-utilities from GitHub (switch CLI source not found)}"
+}
+recreate() { if exists; then d rm -f "$C" >/dev/null; fi; ctl_up; }
+
+health() { d exec "$C" python -c 'import json,os,urllib.request
+h=json.load(urllib.request.urlopen("http://127.0.0.1:%s/health" % os.environ["DIAL0_API_PORT"],timeout=4))
+print("\n".join(f"  {k}: {v}" for k,v in h["cli_index"].items()))' 2>/dev/null; }
+
+wait_ready() {
+  local t=0 limit="${1:-1200}"
+  printf 'Loading the model (a few minutes on %s CPU)' "${NCPU:-1}"
+  while [ "$t" -lt "$limit" ]; do
+    if health >/dev/null; then printf ' ready.\n'; return 0; fi
+    if ! running; then printf '\n'; d logs --tail 30 "$C" 2>&1 | sed 's/^/  | /'; die "container stopped, see logs above (dial0 ctl logs)"; fi
+    printf '.'; sleep 10; t=$(( t + 10 ))
+  done
+  printf '\n'; warn "not ready after ${limit}s; check: dial0 ctl logs"; return 1
+}
+
+link_cmd() {
+  local target="$BIN_DIR/dial0"
+  if [ -w "$BIN_DIR" ]; then ln -sf "$SELF" "$target"; else sudo ln -sf "$SELF" "$target"; fi
+  say "installed command: $target"
+}
+
+# ------------------------------------------------------------------ update from a new tarball
+ctl_update() {  # dial0 ctl update [path/to/dial0-sonic.tar.gz]
+  local tb="${1:-}" c
+  if [ -z "$tb" ]; then
+    for c in "$HOME_DIR/dial0-sonic.tar.gz" "$(dirname "$HOME_DIR")/dial0-sonic.tar.gz" "$HOME/dial0-sonic.tar.gz"; do
+      [ -f "$c" ] && { tb="$c"; break; }
+    done
+  fi
+  [ -n "$tb" ] && [ -f "$tb" ] || die "no dial0-sonic.tar.gz found; usage: dial0 ctl update /path/to/dial0-sonic.tar.gz"
+  tar tzf "$tb" | grep '^dial0-sonic/host/dial0$' >/dev/null || die "$tb is not a Dial 0 tarball"
+  say "Updating $HOME_DIR from $tb (your dial0.conf settings are kept)"
+  cp "$CONF" "$CONF.mine"
+  tar xzf "$tb" -C "$HOME_DIR" --strip-components=1
+  # keep every setting from your old dial0.conf; settings new in this version keep their defaults
+  local line key val esc
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"; val="${val%%[[:space:]]*}"
+    esc="${val//&/\\&}"; esc="${esc//|/\\|}"
+    if grep -q "^${key}=" "$CONF"; then sed -i -E "s|^(${key}=)[^[:space:]#]*|\\1${esc}|" "$CONF"
+    else echo "${key}=${val}" >> "$CONF"; fi   # a setting of yours the new file doesn't list: keep it
+  done < "$CONF.mine"
+  rm -f "$CONF.mine"
+  say "Files updated. Running setup (only what changed is rebuilt)..."
+  exec "$HOME_DIR/host/dial0" ctl install
+}
+
+# ------------------------------------------------------------------ settings
+ctl_set() {
+  [ $# -gt 0 ] || die "usage: dial0 ctl set KEY=VALUE [KEY=VALUE ...]   e.g. dial0 ctl set CPUS=2 MEMORY=6g"
+  local kv key val restart=0 remodel=0 redoc=0 rebuild=0 backup="$CONF.bak" set_cpuset=0 cpus_changed=0
+  for kv in "$@"; do [ "${kv%%=*}" = CPUSET ] && set_cpuset=1; done
+  cp "$CONF" "$backup"
+  for kv in "$@"; do
+    [[ "$kv" == *=* ]] || die "expected KEY=VALUE, got '$kv'"
+    key="${kv%%=*}"; val="${kv#*=}"
+    [[ "$val" =~ ^[^[:space:]\"\'\\\`\$]*$ ]] || die "$key: value must not contain spaces, quotes, \\, \` or \$"
+    case "$key" in
+      CONFIRM) [[ "$val" =~ ^(ask|dry-run|auto)$ ]] || die "CONFIRM must be ask, dry-run or auto" ;;
+      CONTEXT|LEARN|SEARCH_RETRY|LIVE_CHECK|REASONING|REPAIR_WITH_MODEL|BANNER|WORKFLOW_INSIGHTS) [[ "$val" =~ ^(on|off)$ ]] || die "$key must be on or off" ;;
+      WARMUP) [[ "$val" =~ ^(on|off|auto)$ ]] || die "WARMUP must be on, off or auto" ;;
+      CPU_TUNE) [[ "$val" =~ ^(native|portable)$ ]] || die "CPU_TUNE must be native or portable" ;;
+      LLAMA_SOURCE) [[ "$val" =~ ^(prebuilt|compile)$ ]] || die "LLAMA_SOURCE must be prebuilt or compile" ;;
+      KEEP_BUILD_CACHE) [[ "$val" =~ ^(yes|no)$ ]] || die "KEEP_BUILD_CACHE must be yes or no" ;;
+      LLAMA_CTX|FIX_ROUNDS) [[ "$val" =~ ^[0-9]+$ ]] || die "$key must be a number" ;;
+      WORKFLOW_KEEP) [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1 ] && [ "$val" -le 500 ] || die "WORKFLOW_KEEP must be 1-500" ;;
+      BUILD_JOBS) [[ "$val" =~ ^([0-9]+|auto)$ ]] || die "BUILD_JOBS must be a number or auto" ;;
+      LLAMA_PORT|API_PORT) [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -ge 1024 ] && [ "$val" -le 65535 ] || die "$key must be a port 1024-65535" ;;
+    esac
+    if [[ "$RUN_KEYS" == *" $key "* ]]; then restart=1
+    elif [[ "$MODEL_KEYS" == *" $key "* ]]; then remodel=1
+    elif [[ "$DOC_KEYS" == *" $key "* ]]; then redoc=1
+    elif [[ "$BUILD_KEYS" == *" $key "* ]]; then rebuild=1
+    else die "unknown setting '$key'. Resources: CPUS CPUSET MEMORY STORAGE. Others: see dial0.conf"; fi
+    [ "$key" = CPUS ] && cpus_changed=1
+    local esc="${val//&/\\&}"; esc="${esc//|/\\|}"
+    if grep -q "^${key}=" "$CONF"; then sed -i -E "s|^(${key}=)[^[:space:]#]*|\\1${esc}|" "$CONF"; else echo "${key}=${val}" >> "$CONF"; fi
+  done
+  if [ "$cpus_changed" = 1 ] && [ "$set_cpuset" = 0 ]; then sed -i -E "s|^(CPUSET=)[^[:space:]#]*|\\1auto|" "$CONF"; fi
+  load_conf
+  if ! check_all run; then cp "$backup" "$CONF"; load_conf; die "settings not changed"; fi
+  rm -f "$backup"
+  say "saved to $CONF"
+  if [ "$remodel" = 1 ]; then
+    fetch_model || die "model download failed; run 'dial0 ctl model' to resume (Dial 0 keeps running the previous model until then)"
+    remove_old_models
+    restart=1
+  fi
+  if [ "$redoc" = 1 ]; then fetch_cmdref || true; restart=1; fi
+  if [ "$restart" = 1 ] && exists; then say "applying: restarting $C (model reload takes a few minutes)"; recreate; fi
+  [ "$rebuild" = 1 ] && say "build settings changed: run 'dial0 ctl rebuild' to apply"
+  return 0
+}
+
+ctl_resources() {
+  local total; total="$(cpu_total)"; FAILED=0; resolve_cpus
+  say "Configured ($CONF):"
+  say "  CPUS=$CPUS (cores ${CPU_LIST:-?} of 0-$(( total - 1 )))  MEMORY=$MEMORY (switch: $(mem_total_mb) MB)  STORAGE=$STORAGE"
+  say "In use:"
+  if exists; then
+    local cs nc mb
+    read -r cs nc mb < <(d inspect -f '{{.HostConfig.CpusetCpus}} {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' "$C")
+    say "  container: cores $cs, cpus $(( nc / 1000000000 )), memory $(( mb / 1048576 )) MB"
+    running && d stats --no-stream --format '  now: cpu {{.CPUPerc}}  ram {{.MemUsage}}' "$C"
+    running && d exec "$C" du -sm /var/lib/dial0 2>/dev/null | awk '{print "  sessions/state: " $1 " MB"}'
+  else say "  container not created"; fi
+  say "  image: $(image_mb) MB    model: ${MODEL_FILE} $(model_local_mb || true) MB    disk free: $(disk_free_mb) MB ($(docker_root))"
+}
+
+usage_ctl() {
+  cat <<U
+dial0 ctl <command>
+  install [--rebuild]    checks + build (only what changed) + model + start + 'dial0' command  (= ./setup.sh)
+  update [TARBALL]       update from a new dial0-sonic.tar.gz (keeps your settings), then install
+  set KEY=VALUE ...      change settings and apply, e.g.  set CPUS=2 MEMORY=6g  |  set CONTEXT=on
+  resources              configured vs actual CPU / RAM / disk
+  model                  download the configured model (resumes an interrupted download)
+  cmdref                 reload the command reference after editing it (re-downloads if CMDREF is a URL); no rebuild
+  check                  run the checks only
+  status                 container, build versions, agent health
+  doctor                 check that SONiC commands run correctly from Dial 0 (harmless: show / --help only)
+  logs | shell           follow logs | shell inside the container
+  start | stop | restart
+  rebuild [--base]       rebuild the app image (seconds); --base also rebuilds llama.cpp/Python/index
+  uninstall              remove container, images, build cache, command (asks about sessions and model)
+  config                 show all settings
+U
+}
+
+ctl() {
+  case "${1:-help}" in
+    install)
+      say "== Dial 0 setup ($HOME_DIR) =="
+      check_all build || exit 1
+      if [ "${2:-}" = "--rebuild" ]; then ctl_build force
+      elif ! have_image || [ "$(image_version)" != "$(src_version)" ]; then
+        have_image && say "The code or build settings in this folder changed since the last build: updating."
+        ctl_build
+      else
+        say "Image $IMAGE is up to date with this folder (version $(src_version))."
+        model_ready || fetch_model || die "model download failed (re-run to resume)"
+      fi
+      if cmdref_is_url && [ ! -f "$CMDREF_DL" ]; then fetch_cmdref || true; fi
+      recreate; link_cmd; wait_ready || true
+      say ""
+      say "Done. Try:  dial0 \"show me the vlans\""
+      say "More:       dial0 --help   |   dial0 ctl set CPUS=2 MEMORY=6g   |   dial0 ctl help" ;;
+    set)       shift; ctl_set "$@" ;;
+    update)    ctl_update "${2:-}" ;;
+    resources) ctl_resources ;;
+    model)     fetch_model && remove_old_models ;;
+    cmdref)    fetch_cmdref || true
+               say "command reference: $(cmdref_file)"
+               if exists; then say "restarting $C to load it"; recreate; fi ;;
+    check)     check_all build ;;
+    build)     ctl_build ;;
+    rebuild)   check_all build || exit 1
+               if [ "${2:-}" = "--base" ]; then ctl_build force; else ctl_build; fi
+               recreate; wait_ready || true ;;
+    up)        ctl_up ;;
+    down)      if exists; then d rm -f "$C" >/dev/null; say "removed $C (sessions kept)"; fi ;;
+    start|stop|restart) d "$1" "$C" ;;
+    status)
+      exists || { say "not installed: run ./setup.sh"; exit 1; }
+      d ps -a --filter "name=^${C}$" --format 'container: {{.Names}}  {{.Status}}'
+      say "  build: running $(running_version), this folder $(src_version)$( [ "$(running_version)" = "$(src_version)" ] || echo '  <- outdated: run ./setup.sh')"
+      say "  model: $MODEL_FILE $(model_ready && echo "($(model_local_mb) MB)" || echo '(not downloaded: dial0 ctl model)')"
+      if running; then health || say "  agent not answering yet (model loading? dial0 ctl logs)"; fi ;;
+    doctor)    running || die "Dial 0 is not running (dial0 ctl status)"
+               d exec "$C" python -m dial0.doctor ;;
+    logs)      d logs -f --tail 100 "$C" ;;
+    shell)     d exec -it "$C" bash ;;
+    uninstall)
+      read -r -p "Remove Dial 0 (container, images, build cache, dial0 command)? [y/N] " a; [ "$a" = y ] || exit 0
+      if exists; then d rm -f "$C" >/dev/null; fi
+      d rmi "$IMAGE" >/dev/null 2>&1 || true
+      remove_old_bases "none"
+      d builder prune -af >/dev/null 2>&1 || true
+      read -r -p "Also delete all sessions (volume $STATE_VOLUME)? [y/N] " a
+      if [ "$a" = y ]; then d volume rm "$STATE_VOLUME" >/dev/null 2>&1 || true; fi
+      read -r -p "Also delete the downloaded model(s) in $M_DIR? [y/N] " a
+      if [ "$a" = y ]; then rm -rf "$M_DIR"; fi
+      if [ -L "$BIN_DIR/dial0" ]; then rm -f "$BIN_DIR/dial0" 2>/dev/null || sudo rm -f "$BIN_DIR/dial0"; fi
+      say "Dial 0 removed. Disk free: $(disk_free_mb) MB" ;;
+    config)    grep -E '^[A-Z_]+=' "$CONF" | sed 's/[[:space:]]*#.*//' ;;
+    help|-h|--help) usage_ctl ;;
+    *) usage_ctl; exit 2 ;;
+  esac
+}
+
+if [ "${1:-}" = "ctl" ]; then shift; ctl "$@"; exit; fi
+if [ "${1:-}" = "--version" ]; then
+  say "this folder: $(src_version) ($HOME_DIR)"
+  if exists; then say "running:     $(running_version)$( [ "$(running_version)" = "$(src_version)" ] && echo '  (up to date)' || echo '  <- outdated: dial0 ctl update, or ./setup.sh')"
+  else say "running:     (not installed)"; fi
+  exit 0
+fi
+
+running || die "Dial 0 is not running. Install: ./setup.sh   Start: dial0 ctl start"
+if [ "$(running_version)" != "$(src_version)" ]; then
+  echo "note: the running Dial 0 is an older build than $HOME_DIR; run ./setup.sh to update (usually seconds)." >&2
+fi
+FLAGS=(-i); if [ -t 0 ] && [ -t 1 ]; then FLAGS=(-it); fi
+if [ -n "${DIAL0_SESSION:-}" ]; then FLAGS+=(-e "DIAL0_SESSION=$DIAL0_SESSION"); fi
+exec "${DOCKER[@]}" exec "${FLAGS[@]}" "$C" dial0 "$@"

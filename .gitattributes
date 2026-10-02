@@ -1,0 +1,10 @@
+# Shell scripts must keep Unix line endings, or they fail on the switch ("bad interpreter").
+*.sh            text eol=lf
+host/dial0      text eol=lf
+host/dial0-quants text eol=lf
+entrypoint.sh   text eol=lf
+dial0.conf      text eol=lf
+Dockerfile      text eol=lf
+*.Dockerfile    text eol=lf
+*.py            text eol=lf
+*.png           binary

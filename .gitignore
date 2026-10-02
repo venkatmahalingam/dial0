@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Model files and downloads (the model is ~3 GB and lives on the switch's disk, never in git)
+models/
+*.gguf
+*.part
+data/
+
+# Build output and archives
+dist/
+build/
+*.tar.gz
+*.zip
+
+# Local settings backups written by `dial0 ctl set` / `ctl update`
+dial0.conf.bak
+dial0.conf.mine
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
