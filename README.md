@@ -607,10 +607,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how to add commands, checks, workflow
 
 ## Contributors
 
-- Venkat Mahalingam – Poolside Infrastructure Company
-- Senthil Kumar Ganesan – Poolside Infrastructure Company
-- Udhay Chandran Shanmugam – Dell Technologies
-- Vinoth Kumar Arumugam – Dell Technologies
+- Venkatesan Mahalingam – Poolside Infrastructure Company, venkat@pic.inc
+- Senthil Kumar Ganesan – Poolside Infrastructure Company, senthil@pic.inc
+- Udhaya Chandran Shanmugam – Dell Technologies, udhayachandran.shanm@dell.com
+- Vinoth Kumar Arumugam – Dell Technologies, vinoth.arumugam@dell.com
 
 ## License
 
